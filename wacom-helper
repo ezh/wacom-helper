@@ -1,0 +1,340 @@
+#!/usr/bin/perl -w
+use warnings;
+use strict;
+use POSIX ();
+use FindBin ();
+use File::Basename ();
+use File::Spec::Functions;
+use YAML::Any;
+use GD;
+use Wacom::Helper;
+
+$|=1;
+
+# make the daemon cross-platform, so exec always calls the script
+# itself with the right path, no matter how the script was invoked.
+my $script = File::Basename::basename($0);
+my $self = catfile($FindBin::Bin, $script);
+my @queue;
+my $timeout_sleep = 0.5;
+my $timeout_work = 0.01;
+my $timeout = $timeout_sleep;
+my $tablet_app = 0;
+my $tablet_mode = 0;
+my $tablet_devices = {};
+my $tablet_usbfs = '';
+my $config = {
+    xsetwacom => '/usr/bin/xsetwacom',
+    lsusb => '/usr/sbin/lsusb',
+    apps => [
+        "default",
+        {
+            mode0 => {
+                Button1 => {
+                    key => 'core key CTRL ALT SHIFT m',
+                },
+                Button2 => {
+                    key => 'core key a',
+                },
+                Button3 => {
+                    key => 'core key b',
+                },
+                Button4 => {
+                    key => 'core key c',
+                },
+                Button5 => {
+                    key => 'core key d',
+                },
+                Button6 => {
+                    key => 'core key e',
+                },
+                Button7 => {
+                    key => 'core key f',
+                },
+                Button8 => {
+                    key => 'core key g',
+                },
+                Button9 => {
+                    key => 'core key CTRL ALT SHIFT a',
+                },
+            },
+        },
+        "MyPaint",
+        {
+            # misc
+            mode4 => {
+                Button1 => {
+                    key => 'core key CTRL ALT SHIFT m',
+                },
+                Button2 => {
+                    key => 'core key a',
+                },
+                Button3 => {
+                    key => 'core key b',
+                },
+                Button4 => {
+                    key => 'core key c',
+                },
+                Button5 => {
+                    key => 'core key d',
+                },
+                Button6 => {
+                    key => 'core key e',
+                },
+                Button7 => {
+                    key => 'core key f',
+                },
+                Button8 => {
+                    key => 'core key g',
+                },
+                Button9 => {
+                    key => 'core key CTRL ALT SHIFT a',
+                },
+            },
+            # brush
+            mode1 => {
+                Button1 => {
+                    key => 'core key CTRL ALT SHIFT m',
+                },
+                Button2 => {
+                    key => 'core key f',
+                },
+                Button3 => {
+                    key => 'core key d',
+                },
+                Button4 => {
+                    key => 'core key s',
+                },
+                Button5 => {
+                    key => 'core key a',
+                },
+                Button6 => {
+                    key => 'core key CTRL',
+                },
+                Button7 => {
+                    key => 'core key SHIFT',
+                },
+                Button8 => {
+                    key => 'core key z',
+                },
+                Button9 => {
+                    key => 'core key CTRL ALT SHIFT a',
+                },
+            },
+            # color
+            mode2 => {
+                Button1 => {
+                    key => 'core key CTRL ALT SHIFT m',
+                },
+                Button2 => {
+                    key => 'core key 1',
+                },
+                Button3 => {
+                    key => 'core key 2',
+                },
+                Button4 => {
+                    key => 'core key w',
+                },
+                Button5 => {
+                    key => 'core key v',
+                },
+                Button6 => {
+                    key => 'core key CTRL',
+                },
+                Button7 => {
+                    key => 'core key SHIFT',
+                },
+                Button8 => {
+                    key => 'core key z',
+                },
+                Button9 => {
+                    key => 'core key CTRL ALT SHIFT a',
+                },
+            },
+            # layer
+            mode3 => {
+                Button1 => {
+                    key => 'core key CTRL ALT SHIFT m',
+                },
+                Button2 => {
+                    key => 'core key period',
+                },
+                Button3 => {
+                    key => 'core key comma',
+                },
+                Button4 => {
+                    key => 'core key Page_Up',
+                },
+                Button5 => {
+                    key => 'core key Page_Down',
+                },
+                Button6 => {
+                    key => 'core key p',
+                },
+                Button7 => {
+                    key => 'core key o',
+                },
+                Button8 => {
+                    key => 'core key h',
+                },
+                Button9 => {
+                    key => 'core key CTRL ALT SHIFT a',
+                },
+            },
+        },
+    ],
+};
+
+# POSIX unmasks the sigprocmask properly
+my $sigset = POSIX::SigSet->new();
+my $sighup = POSIX::SigAction->new('sigHUP_handler', $sigset, &POSIX::SA_NODEFER);
+my $sigusr1 = POSIX::SigAction->new('sigUSR1_handler', $sigset, &POSIX::SA_NODEFER);
+my $sigusr2 = POSIX::SigAction->new('sigUSR2_handler', $sigset, &POSIX::SA_NODEFER);
+POSIX::sigaction(&POSIX::SIGHUP, $sighup);
+POSIX::sigaction(&POSIX::SIGUSR1, $sigusr1);
+POSIX::sigaction(&POSIX::SIGUSR2, $sigusr2);
+
+# reload config
+sub sigHUP_handler {
+    print "got SIGHUP\n";
+    exec($self, @ARGV) or die "Couldn't restart: $!\n";
+};
+
+# change tablet mode
+sub sigUSR1_handler {
+    push(@queue, 1);
+    $timeout = $timeout_work;
+};
+
+# change tablet application
+sub sigUSR2_handler {
+    push(@queue, 2);
+    $timeout = $timeout_work;
+};
+
+sub show_text {
+    my $text = shift();
+    my $rawim;
+    my $im = GD::Image->new(64,32);
+    my $black = $im->colorAllocate(0,0,0);
+    my $white = $im->colorAllocate(255,255,255);
+    $im->fill(0,0,$black);
+    $im->string(gdSmallFont, 0, 0, $text, $white);
+    for (my $y = 0; $y < 32; $y++) {
+        for (my $x = 0; $x < 64; $x++) {
+            if ($im->getPixel($x,$y)) {
+                $rawim .= chr(0);
+            } else {
+                $rawim .= chr(255);
+            };
+        };
+    };
+    print Wacom::Helper::set_image_led($tablet_usbfs, $rawim, 1);
+}
+
+sub change_mode {
+    my $modenum = shift();
+    my $mode = $config->{apps}[$tablet_app*2+1]{'mode'.$modenum};
+    if (not defined $mode) {
+        print("mode $modenum not found\n");
+        return;
+    };
+    print("activate mode $modenum for application '".$config->{apps}[$tablet_app*2]."'\n");
+    Wacom::Helper::set_ring_led($tablet_usbfs, $modenum-1);
+    select(undef, undef, undef, 0.25);
+    if (scalar(@queue)) {
+        # skip actual mode switch if there is a new signal in queue
+        return 1;
+    };
+    foreach my $button (keys(%{$mode})) {
+        next unless $mode->{$button}{key};
+        my $command = $config->{xsetwacom}.' set \''.$tablet_devices->{pad}.'\' '.$button.' "'.$mode->{$button}{key}.'"';
+        print("run '$command'\n");
+        open(STATUS, "$command 2>&1 |");
+        while(my $line = <STATUS>) {
+        };
+        close(STATUS);
+    };
+    return 1;
+};
+
+sub init {
+    # search wacom tablet devices
+    open(STATUS, $config->{xsetwacom}.' --list dev 2>&1 |') || die "can't fork xsetwacom: $!";
+    while(my $line = <STATUS>) {
+        my @words = split(' ', $line);
+        my $device = pop(@words);
+        if ($device eq 'ERASER') {
+            $tablet_devices->{eraser} = join(' ', @words);
+        } elsif ($device eq 'CURSOR') {
+            $tablet_devices->{cursor} = join(' ', @words);
+        } elsif ($device eq 'PAD') {
+            $tablet_devices->{pad} = join(' ', @words);
+        } elsif ($device eq 'STYLUS') {
+            $tablet_devices->{stylus} = join(' ', @words);
+        } else {
+            die("unknown device in line: $line")
+        };
+    };
+    close STATUS || die("bad xsetwacom: $! $?");
+    die ("Wacom pad not found") unless exists $tablet_devices->{pad};
+    # search for usbfs
+    open(STATUS, $config->{lsusb}. ' 2>&1 |') || die "can't fork lsusb: $!";
+    while(my $line = <STATUS>) {
+    if ($line =~ /Bus (\d+) Device (\d+): ID ....:.... Wacom/) {
+        $tablet_usbfs = "/proc/bus/usb/$1/$2";
+        last;
+    };
+    };
+    close STATUS || die("bad lsusb: $! $?");
+    # rebind buttons
+    die("please, create at least one configuration") unless $#{$config->{apps}};
+    print("detected configurations:\n");
+    for(my $i = 0; $i <= $#{$config->{apps}}; $i=$i+2) {
+        print("\t".$config->{apps}[$i]."\n");
+    };
+    change_mode($tablet_mode) || die 'set initial mode failed';
+    show_text("hello");
+};
+
+main();
+
+sub main {
+    print "PID: $$\n";
+    init();
+    while(1) {
+        if (my $request = shift(@queue)) {
+            if ($request == 1) {
+                # USR1
+                print("request to change mode from $tablet_mode to ".($tablet_mode+1)." for application $tablet_app\n");
+                $tablet_mode++;
+                if (not change_mode($tablet_mode)) {
+                    $tablet_mode = 0;
+                    while (not change_mode($tablet_mode)) {
+                        $tablet_mode++;
+                        if ($tablet_mode>4) {
+                            die;
+                        };
+                    };
+                };
+            } else {
+                # USR2
+                print("request to change application from '".$config->{apps}[$tablet_app*2]."' to '".$config->{apps}[$tablet_app*2+2]."'\n");
+                if (defined($config->{apps}[$tablet_app*2+2])) {
+                    $tablet_app++;
+                    $tablet_mode = 0;
+                    while (not change_mode($tablet_mode)) {
+                        $tablet_mode++;
+                        if ($tablet_mode>4) {
+                            die;
+                        };
+                    };
+                };
+            };
+        } else {
+            $timeout = $timeout_sleep;
+        };
+        select(undef, undef, undef, $timeout);
+    };
+};
+__END__
